@@ -52,7 +52,7 @@ except ImportError:
 
 # ── method registry ──────────────────────────────────────────────────────────
 CLASSICAL = ["density", "morphology", "graph"]
-GPU_METHODS = ["sam2", "stagate", "unet", "multimodal"]
+GPU_METHODS = ["sam2", "stagate", "unet", "multimodal", "ensemble"]
 ALL_METHODS = CLASSICAL + GPU_METHODS
 
 
@@ -74,6 +74,8 @@ def import_method(name: str):
     """Dynamically import methods/<name>.py or methods/<name>_seg.py."""
     if name == "multimodal":
         mod_name = "methods.multimodal_gnn"
+    elif name == "ensemble":
+        mod_name = "methods.ensemble"
     elif name in ("sam2", "stagate", "unet"):
         mod_name = f"methods.{name}_seg"
     else:

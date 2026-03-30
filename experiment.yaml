@@ -1,5 +1,5 @@
 version: v2
-description: "Nautilex villi segmentation — 7 methods (classical + DL)"
+description: "Nautilex villi segmentation — v4 improved U-Net + GNN + ensemble"
 
 tasks:
   - name: segment
@@ -16,7 +16,7 @@ tasks:
       - name: OUTPUT_DIR
         value: /output
       - name: METHOD
-        value: all
+        value: unet,multimodal,ensemble
     datasets:
       - mountPath: /data
         source:

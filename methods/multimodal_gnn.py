@@ -4,6 +4,13 @@ Combines DAPI morphology features with gene expression via a GATv2-based
 graph neural network. Cells are nodes; KNN spatial graph provides edges.
 Semi-supervised: trains on GT-annotated cells, propagates to all ~157K cells.
 All output polygons are in micron coordinates.
+
+Improvements over v3 baseline:
+  - Edge features: spatial distance + expression cosine similarity per edge
+  - HDBSCAN clustering for density-adaptive instance separation
+  - Threshold sweep (0.3–0.7) picking best count vs GT polygon count
+  - Cosine LR scheduler for smoother convergence
+  - Full GPU seeding for reproducibility
 """
 
 from __future__ import annotations
@@ -20,6 +27,11 @@ from shapely.geometry import Polygon
 
 from utils.coords import micron_to_pixel, PIXEL_SIZE_UM
 from utils.io import load_cells, load_expression_h5, load_morphology, load_annotations
+
+RANDOM_SEED = 42
+
+# Threshold sweep for probability cutoff
+THRESHOLD_CANDIDATES = [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7]
 
 
 def _ts() -> str:
@@ -67,7 +79,7 @@ def _pca_features(expr: np.ndarray, n_components: int = 20) -> np.ndarray:
     """
     from sklearn.decomposition import PCA
 
-    pca = PCA(n_components=n_components, random_state=42)
+    pca = PCA(n_components=n_components, random_state=RANDOM_SEED)
     return pca.fit_transform(expr).astype(np.float32)
 
 
@@ -86,7 +98,7 @@ def _extract_image_features(
     centroids_um : np.ndarray
         Cell centroids in micron coords, shape (n_cells, 2) with columns [x, y].
     patch_half : int
-        Half-size of patch in pixels (default 16 → 32x32 patches).
+        Half-size of patch in pixels (default 16 -> 32x32 patches).
 
     Returns
     -------
@@ -117,7 +129,7 @@ def _extract_image_features(
         c_end_clamped = min(W, c_end)
 
         if r_start_clamped >= r_end_clamped or c_start_clamped >= c_end_clamped:
-            # Cell completely outside image — leave zeros
+            # Cell completely outside image -- leave zeros
             continue
 
         patch = dapi_f[r_start_clamped:r_end_clamped, c_start_clamped:c_end_clamped]
@@ -154,17 +166,27 @@ def _extract_image_features(
 
 
 # ======================================================================
-# Phase B: Graph construction
+# Phase B: Graph construction (with edge features)
 # ======================================================================
 
 
-def _build_knn_graph(coords: np.ndarray, k: int = 10):
-    """Build KNN graph from spatial coordinates.
+def _build_knn_graph_with_edge_features(
+    coords: np.ndarray,
+    node_features: np.ndarray,
+    k: int = 10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build KNN graph with edge features from spatial coordinates.
+
+    Edge features (2-dim per edge):
+      - Normalised Euclidean distance between connected cells
+      - Cosine similarity of node feature vectors
 
     Parameters
     ----------
     coords : np.ndarray, shape (n_cells, 2)
         Spatial coordinates (microns).
+    node_features : np.ndarray, shape (n_cells, d)
+        Standardized node feature vectors.
     k : int
         Number of nearest neighbors.
 
@@ -172,6 +194,8 @@ def _build_knn_graph(coords: np.ndarray, k: int = 10):
     -------
     edge_index : np.ndarray, shape (2, n_edges), int64
         COO format edge index (symmetric / undirected).
+    edge_attr : np.ndarray, shape (n_edges, 2), float32
+        Edge features: [normalised_distance, cosine_similarity].
     """
     from sklearn.neighbors import NearestNeighbors
 
@@ -182,18 +206,39 @@ def _build_knn_graph(coords: np.ndarray, k: int = 10):
     n = len(coords)
     src = np.repeat(np.arange(n), k)
     dst = indices[:, 1:].ravel()  # skip self (column 0)
+    knn_dists = distances[:, 1:].ravel()
 
     # Make undirected by adding both directions, then deduplicate
     edge_src = np.concatenate([src, dst])
     edge_dst = np.concatenate([dst, src])
+    edge_dists = np.concatenate([knn_dists, knn_dists])
 
     # Deduplicate
     edges = np.stack([edge_src, edge_dst], axis=0)
     edges_sorted = np.sort(edges, axis=0)
     _, unique_idx = np.unique(edges_sorted[0] * n + edges_sorted[1], return_index=True)
     edge_index = edges[:, unique_idx]
+    edge_dists = edge_dists[unique_idx]
 
-    return edge_index.astype(np.int64)
+    # --- Edge feature 1: Normalised distance ---
+    # Normalise distances to [0, 1] range (0 = closest, 1 = farthest among edges)
+    d_max = edge_dists.max() if edge_dists.max() > 0 else 1.0
+    norm_dist = (edge_dists / d_max).astype(np.float32)
+
+    # --- Edge feature 2: Cosine similarity of node features ---
+    src_feats = node_features[edge_index[0]]
+    dst_feats = node_features[edge_index[1]]
+    # Cosine similarity: dot(a, b) / (||a|| * ||b||)
+    dot = (src_feats * dst_feats).sum(axis=1)
+    norm_src = np.linalg.norm(src_feats, axis=1)
+    norm_dst = np.linalg.norm(dst_feats, axis=1)
+    denom = norm_src * norm_dst
+    denom[denom < 1e-8] = 1e-8
+    cos_sim = (dot / denom).astype(np.float32)
+
+    edge_attr = np.stack([norm_dist, cos_sim], axis=1)
+
+    return edge_index.astype(np.int64), edge_attr
 
 
 # ======================================================================
@@ -222,7 +267,7 @@ def _assign_labels(
     labels = np.full(n_cells, -1, dtype=np.int32)
 
     if not gt_polygons:
-        print(f"[{_ts()}]   WARNING: no GT polygons — all cells unlabeled")
+        print(f"[{_ts()}]   WARNING: no GT polygons -- all cells unlabeled")
         return labels
 
     # Merge GT polys for distance computation
@@ -240,10 +285,10 @@ def _assign_labels(
             labels[i] = 1
             n_pos += 1
         elif not gt_buffered.contains(pt):
-            # Far from GT polygons → negative
+            # Far from GT polygons -> negative
             labels[i] = 0
             n_neg += 1
-        # else: near but not inside → stays -1
+        # else: near but not inside -> stays -1
 
     print(
         f"[{_ts()}]   labels: {n_pos:,} positive, {n_neg:,} negative, "
@@ -253,19 +298,20 @@ def _assign_labels(
 
 
 # ======================================================================
-# Phase D: GNN model & training
+# Phase D: GNN model & training (with edge features + cosine LR)
 # ======================================================================
 
 
 def _build_and_train(
     node_features: np.ndarray,
     edge_index: np.ndarray,
+    edge_attr: np.ndarray,
     labels: np.ndarray,
     n_epochs: int = 200,
     lr: float = 1e-3,
     hidden: int = 64,
 ):
-    """Build GATv2 model, train semi-supervised, return predictions.
+    """Build GATv2 model with edge features, train semi-supervised.
 
     Returns
     -------
@@ -282,13 +328,28 @@ def _build_and_train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[{_ts()}]   device: {device}")
 
-    # ----- Model -----
+    # Set seeds for reproducibility
+    torch.manual_seed(RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    edge_dim = edge_attr.shape[1]  # 2 (distance + cosine similarity)
+
+    # ----- Model with edge features -----
     class VillusGNN(torch.nn.Module):
-        def __init__(self, in_channels: int, hidden: int = 64):
+        def __init__(self, in_channels: int, hidden: int = 64, edge_dim: int = 2):
             super().__init__()
-            self.conv1 = GATv2Conv(in_channels, hidden, heads=4, concat=True)
-            self.conv2 = GATv2Conv(hidden * 4, hidden, heads=4, concat=True)
-            self.conv3 = GATv2Conv(hidden * 4, hidden, heads=1, concat=False)
+            # GATv2Conv accepts edge_attr when edge_dim is specified
+            self.conv1 = GATv2Conv(
+                in_channels, hidden, heads=4, concat=True, edge_dim=edge_dim
+            )
+            self.conv2 = GATv2Conv(
+                hidden * 4, hidden, heads=4, concat=True, edge_dim=edge_dim
+            )
+            self.conv3 = GATv2Conv(
+                hidden * 4, hidden, heads=1, concat=False, edge_dim=edge_dim
+            )
             self.classifier = torch.nn.Sequential(
                 torch.nn.Linear(hidden, 32),
                 torch.nn.ReLU(),
@@ -296,20 +357,21 @@ def _build_and_train(
                 torch.nn.Linear(32, 1),
             )
 
-        def forward(self, x, edge_index):
-            x = F.elu(self.conv1(x, edge_index))
+        def forward(self, x, edge_index, edge_attr):
+            x = F.elu(self.conv1(x, edge_index, edge_attr=edge_attr))
             x = F.dropout(x, p=0.3, training=self.training)
-            x = F.elu(self.conv2(x, edge_index))
+            x = F.elu(self.conv2(x, edge_index, edge_attr=edge_attr))
             x = F.dropout(x, p=0.3, training=self.training)
-            x = self.conv3(x, edge_index)
+            x = self.conv3(x, edge_index, edge_attr=edge_attr)
             return self.classifier(x).squeeze(-1)
 
     # ----- Data -----
     x = torch.from_numpy(node_features).float()
     ei = torch.from_numpy(edge_index).long()
+    ea = torch.from_numpy(edge_attr).float()
     y = torch.from_numpy(labels).long()
 
-    data = Data(x=x, edge_index=ei, y=y)
+    data = Data(x=x, edge_index=ei, edge_attr=ea, y=y)
     data = data.to(device)
 
     # Training mask: only labeled cells (label != -1)
@@ -329,29 +391,36 @@ def _build_and_train(
     )
 
     # ----- Model init -----
-    model = VillusGNN(in_channels=node_features.shape[1], hidden=hidden).to(device)
+    model = VillusGNN(
+        in_channels=node_features.shape[1], hidden=hidden, edge_dim=edge_dim
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=1e-6
+    )
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[{_ts()}]   model parameters: {total_params:,}")
+    print(f"[{_ts()}]   edge features: {edge_dim}-dim (distance + cosine similarity)")
 
     # ----- Training loop -----
     loss_history = []
     model.train()
     for epoch in range(1, n_epochs + 1):
         optimizer.zero_grad()
-        logits = model(data.x, data.edge_index)
+        logits = model(data.x, data.edge_index, data.edge_attr)
         loss = criterion(logits[train_mask], y_train)
         loss.backward()
         optimizer.step()
+        scheduler.step()
         loss_history.append(loss.item())
 
         if epoch % 20 == 0 or epoch == 1:
             # Evaluate on labeled cells
             model.eval()
             with torch.no_grad():
-                logits_eval = model(data.x, data.edge_index)
+                logits_eval = model(data.x, data.edge_index, data.edge_attr)
                 probs_eval = torch.sigmoid(logits_eval[train_mask])
                 preds_eval = (probs_eval > 0.5).long()
                 acc = (preds_eval == y_train.long()).float().mean().item()
@@ -364,51 +433,69 @@ def _build_and_train(
                 except Exception:
                     auc = float("nan")
 
+            cur_lr = scheduler.get_last_lr()[0]
             print(
                 f"[{_ts()}]   epoch {epoch:>3d}/{n_epochs} | "
-                f"loss={loss.item():.4f} | acc={acc:.4f} | AUC={auc:.4f}"
+                f"loss={loss.item():.4f} | acc={acc:.4f} | AUC={auc:.4f} | "
+                f"lr={cur_lr:.2e}"
             )
             model.train()
 
     # ----- Inference on all cells -----
     model.eval()
     with torch.no_grad():
-        logits_all = model(data.x, data.edge_index)
+        logits_all = model(data.x, data.edge_index, data.edge_attr)
         probs_all = torch.sigmoid(logits_all).cpu().numpy()
 
     return probs_all, loss_history
 
 
 # ======================================================================
-# Phase E: Polygon extraction
+# Phase E: Polygon extraction (HDBSCAN + threshold sweep)
 # ======================================================================
 
 
-def _extract_polygons(
+def _extract_polygons_hdbscan(
     centroids_um: np.ndarray,
     probs: np.ndarray,
     threshold: float = 0.5,
-    eps_um: float = 30.0,
+    min_cluster_size: int = 50,
     min_samples: int = 10,
     hull_ratio: float = 0.3,
     buffer_um: float = 5.0,
     simplify_um: float = 2.0,
     min_area_um2: float = 5000.0,
 ) -> list[Polygon]:
-    """Cluster positive cells with DBSCAN and extract concave hulls.
+    """Cluster positive cells with HDBSCAN and extract concave hulls.
+
+    HDBSCAN adapts to variable-density clusters, avoiding the hard eps
+    parameter of DBSCAN that caused close villi to merge or sparse villi
+    to split.
 
     Returns
     -------
     list[Polygon]
         Villi polygons in micron coordinates.
     """
-    from sklearn.cluster import DBSCAN
     from shapely.geometry import MultiPoint
     from shapely import concave_hull
 
+    # Try HDBSCAN first, fall back to DBSCAN if not available
+    try:
+        import hdbscan
+
+        _USE_HDBSCAN = True
+    except ImportError:
+        from sklearn.cluster import DBSCAN
+
+        _USE_HDBSCAN = False
+        print(f"[{_ts()}]   WARNING: hdbscan not installed, falling back to DBSCAN")
+
     pos_mask = probs >= threshold
     n_pos = pos_mask.sum()
-    print(f"[{_ts()}]   positive cells: {n_pos:,} / {len(probs):,}")
+    print(
+        f"[{_ts()}]   positive cells (thr={threshold:.2f}): {n_pos:,} / {len(probs):,}"
+    )
 
     if n_pos < min_samples:
         print(f"[{_ts()}]   too few positive cells for clustering")
@@ -416,11 +503,25 @@ def _extract_polygons(
 
     pos_coords = centroids_um[pos_mask]
 
-    # DBSCAN spatial clustering
-    db = DBSCAN(eps=eps_um, min_samples=min_samples, n_jobs=-1)
-    cluster_labels = db.fit_predict(pos_coords)
-    n_clusters = cluster_labels.max() + 1
-    print(f"[{_ts()}]   DBSCAN found {n_clusters} clusters (eps={eps_um} µm)")
+    if _USE_HDBSCAN:
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_method="eom",
+            core_dist_n_jobs=-1,
+        )
+        cluster_labels = clusterer.fit_predict(pos_coords)
+        n_clusters = cluster_labels.max() + 1
+        n_noise = (cluster_labels == -1).sum()
+        print(
+            f"[{_ts()}]   HDBSCAN found {n_clusters} clusters "
+            f"({n_noise:,} noise points)"
+        )
+    else:
+        db = DBSCAN(eps=30.0, min_samples=min_samples, n_jobs=-1)
+        cluster_labels = db.fit_predict(pos_coords)
+        n_clusters = cluster_labels.max() + 1
+        print(f"[{_ts()}]   DBSCAN fallback: {n_clusters} clusters (eps=30 um)")
 
     polygons: list[Polygon] = []
     for cid in range(n_clusters):
@@ -453,9 +554,50 @@ def _extract_polygons(
 
     print(
         f"[{_ts()}]   {len(polygons)} polygons after area filter "
-        f"(>= {min_area_um2:.0f} µm²)"
+        f"(>= {min_area_um2:.0f} um^2)"
     )
     return polygons
+
+
+def _find_best_threshold(
+    centroids_um: np.ndarray,
+    probs: np.ndarray,
+    n_gt_polygons: int,
+    candidates: list[float] = THRESHOLD_CANDIDATES,
+) -> float:
+    """Sweep thresholds and pick the one producing the polygon count closest to GT.
+
+    This is a fast proxy — the real metric is polygon IoU, but polygon count
+    is a cheap heuristic that avoids running full HDBSCAN for every candidate.
+    We count the number of connected spatial clusters at each threshold.
+    """
+    from sklearn.cluster import DBSCAN
+
+    best_thr = 0.5
+    best_diff = float("inf")
+
+    for thr in candidates:
+        pos_mask = probs >= thr
+        n_pos = pos_mask.sum()
+        if n_pos < 10:
+            continue
+
+        # Quick DBSCAN to count clusters
+        pos_coords = centroids_um[pos_mask]
+        db = DBSCAN(eps=30.0, min_samples=10, n_jobs=-1)
+        labels = db.fit_predict(pos_coords)
+        n_clusters = labels.max() + 1
+
+        diff = abs(n_clusters - n_gt_polygons)
+        if diff < best_diff:
+            best_diff = diff
+            best_thr = thr
+
+    print(
+        f"[{_ts()}]   threshold sweep: best={best_thr:.2f} "
+        f"(cluster count diff from GT: {best_diff})"
+    )
+    return best_thr
 
 
 # ======================================================================
@@ -497,8 +639,8 @@ def _save_diagnostics(
         xs, ys = poly.exterior.xy
         ax.plot(xs, ys, color="cyan", linewidth=1.0, label="Pred")
 
-    ax.set_xlabel("x (µm)")
-    ax.set_ylabel("y (µm)")
+    ax.set_xlabel("x (um)")
+    ax.set_ylabel("y (um)")
     ax.set_title(f"Multimodal GNN predictions ({len(polygons)} villi detected)")
     ax.set_aspect("equal")
     ax.invert_yaxis()
@@ -513,7 +655,7 @@ def _save_diagnostics(
     scatter_path = output_dir / "gnn_predictions.png"
     fig.savefig(scatter_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"[{_ts()}]   saved predictions scatter → {scatter_path}")
+    print(f"[{_ts()}]   saved predictions scatter -> {scatter_path}")
 
     # --- Training loss curve ---
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -527,7 +669,7 @@ def _save_diagnostics(
     fig.tight_layout()
     fig.savefig(loss_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"[{_ts()}]   saved loss curve → {loss_path}")
+    print(f"[{_ts()}]   saved loss curve -> {loss_path}")
 
 
 # ======================================================================
@@ -557,7 +699,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
         import torch_geometric  # noqa: F401
     except ImportError as e:
         print(
-            f"[{_ts()}] multimodal_gnn: ERROR — PyTorch Geometric not available: {e}\n"
+            f"[{_ts()}] multimodal_gnn: ERROR -- PyTorch Geometric not available: {e}\n"
             "  Install with: pip install torch-geometric\n"
             "  Returning empty list."
         )
@@ -578,18 +720,18 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     n_cells = len(cells)
     print(f"[{_ts()}]   {n_cells:,} cells loaded")
 
-    # A2. Gene expression → normalize → PCA
+    # A2. Gene expression -> normalize -> PCA
     print(f"[{_ts()}] loading gene expression ...")
     expr_mat, gene_names, cell_ids = load_expression_h5(data_path)
     print(
-        f"[{_ts()}]   expression matrix: {expr_mat.shape[0]:,} cells × "
+        f"[{_ts()}]   expression matrix: {expr_mat.shape[0]:,} cells x "
         f"{expr_mat.shape[1]} genes"
     )
 
-    print(f"[{_ts()}] normalizing expression (total-count → log1p) ...")
+    print(f"[{_ts()}] normalizing expression (total-count -> log1p) ...")
     expr_norm = _normalize_expression(expr_mat)
 
-    print(f"[{_ts()}] PCA → 20 components ...")
+    print(f"[{_ts()}] PCA -> 20 components ...")
     gene_pca = _pca_features(expr_norm, n_components=20)
     print(f"[{_ts()}]   gene_pca shape: {gene_pca.shape}")
 
@@ -598,7 +740,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     dapi = load_morphology(data_path, max_project=True)
     print(f"[{_ts()}]   DAPI shape: {dapi.shape}, dtype: {dapi.dtype}")
 
-    print(f"[{_ts()}] extracting per-cell image features (32×32 patches) ...")
+    print(f"[{_ts()}] extracting per-cell image features (32x32 patches) ...")
     img_features = _extract_image_features(dapi, centroids_um)
     print(f"[{_ts()}]   image features shape: {img_features.shape}")
 
@@ -616,14 +758,20 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     node_features = ((node_features - feat_mean) / feat_std).astype(np.float32)
 
     # ==================================================================
-    # Phase B: Graph construction
+    # Phase B: Graph construction (with edge features)
     # ==================================================================
     print(f"\n[{_ts()}] ===== Phase B: Graph construction =====")
-    print(f"[{_ts()}] building KNN graph (k=10) ...")
-    edge_index = _build_knn_graph(centroids_um, k=10)
+    print(f"[{_ts()}] building KNN graph (k=10) with edge features ...")
+    edge_index, edge_attr = _build_knn_graph_with_edge_features(
+        centroids_um, node_features, k=10
+    )
     print(
         f"[{_ts()}]   edges: {edge_index.shape[1]:,} "
         f"(~{edge_index.shape[1] / n_cells:.1f} per node)"
+    )
+    print(
+        f"[{_ts()}]   edge features: {edge_attr.shape[1]}-dim "
+        f"(distance + cosine similarity)"
     )
 
     # ==================================================================
@@ -640,7 +788,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     n_labeled = (labels >= 0).sum()
     if n_labeled == 0:
         print(
-            f"[{_ts()}] ERROR: no labeled cells found — cannot train. "
+            f"[{_ts()}] ERROR: no labeled cells found -- cannot train. "
             "Check GT annotations."
         )
         return []
@@ -652,21 +800,34 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     probs, loss_history = _build_and_train(
         node_features=node_features,
         edge_index=edge_index,
+        edge_attr=edge_attr,
         labels=labels,
         n_epochs=200,
         lr=1e-3,
         hidden=64,
     )
 
+    # Save cell probabilities for ensemble use
+    np.save(out / "cell_probs.npy", probs)
+    np.save(out / "cell_centroids_um.npy", centroids_um)
+    print(f"[{_ts()}] saved cell probabilities + centroids for ensemble use")
+
     # ==================================================================
-    # Phase E: Polygon extraction
+    # Phase E: Inference & polygon extraction
     # ==================================================================
     print(f"\n[{_ts()}] ===== Phase E: Inference & polygon extraction =====")
-    polygons = _extract_polygons(
+
+    # Threshold sweep
+    best_threshold = _find_best_threshold(
+        centroids_um, probs, n_gt_polygons=len(gt_polygons)
+    )
+
+    # HDBSCAN clustering
+    polygons = _extract_polygons_hdbscan(
         centroids_um=centroids_um,
         probs=probs,
-        threshold=0.5,
-        eps_um=30.0,
+        threshold=best_threshold,
+        min_cluster_size=50,
         min_samples=10,
         hull_ratio=0.3,
         buffer_um=5.0,
@@ -687,5 +848,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
         loss_history=loss_history,
     )
 
-    print(f"\n[{_ts()}] multimodal_gnn: DONE — {len(polygons)} villi polygons returned")
+    print(
+        f"\n[{_ts()}] multimodal_gnn: DONE -- {len(polygons)} villi polygons returned"
+    )
     return polygons

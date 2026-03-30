@@ -25,7 +25,8 @@ RUN pip install --no-cache-dir \
 
 # Segmentation models + SAM2
 # Leiden clustering deps (needed by scanpy's sc.tl.leiden)
-RUN pip install --no-cache-dir igraph leidenalg
+# HDBSCAN for multimodal GNN clustering
+RUN pip install --no-cache-dir igraph leidenalg hdbscan
 
 RUN pip install --no-cache-dir segmentation-models-pytorch>=0.3.3 albumentations
 RUN pip install --no-cache-dir "sam-2 @ git+https://github.com/facebookresearch/sam2.git"
