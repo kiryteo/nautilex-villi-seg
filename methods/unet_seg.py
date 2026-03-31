@@ -108,8 +108,12 @@ def _compute_boundary_weight_map(
     # Distance from background boundary (outward)
     dist_out = ndi.distance_transform_edt(~mask)
 
-    # Minimum distance to boundary from either side
-    dist_to_edge = np.minimum(dist_in, dist_out)
+    # Pick the meaningful distance for each pixel:
+    # - FG pixels: dist_in  (distance to nearest BG = boundary)
+    # - BG pixels: dist_out (distance to nearest FG = boundary)
+    # NOTE: np.minimum(dist_in, dist_out) was wrong here — one of them is
+    # always 0 for every pixel, so the result was uniformly 0.
+    dist_to_edge = np.where(mask, dist_in, dist_out)
 
     # Weight ramp: pixels within *width* get linearly ramped from *weight* to 1
     w = np.ones_like(mask, dtype=np.float32)

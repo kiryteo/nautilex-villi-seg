@@ -1,5 +1,5 @@
 # ── base: PyTorch + CUDA for GPU methods ─────────────────────────────────────
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
@@ -11,7 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python dependencies (layered for cache efficiency) ───────────────────────
+# ── Pin PyTorch to prevent dependency upgrades past CUDA 12.4 ────────────────
+# The base image provides torch 2.5.1+cu124. We pin it to prevent
+# segmentation-models-pytorch or sam2 from upgrading to a newer torch.
+ENV PIP_NO_DEPS_FOR_TORCH=1
+
 # Core scientific stack first (rarely changes)
 COPY requirements.txt .
 RUN pip install --no-cache-dir \
@@ -20,7 +24,7 @@ RUN pip install --no-cache-dir \
 
 # PyTorch Geometric (needs torch already installed)
 RUN pip install --no-cache-dir \
-        torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.1.0+cu121.html && \
+        torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.5.1+cu124.html && \
     pip install --no-cache-dir torch-geometric
 
 # Segmentation models + SAM2
@@ -28,8 +32,10 @@ RUN pip install --no-cache-dir \
 # HDBSCAN for multimodal GNN clustering
 RUN pip install --no-cache-dir igraph leidenalg hdbscan
 
-RUN pip install --no-cache-dir segmentation-models-pytorch>=0.3.3 albumentations
-RUN pip install --no-cache-dir "sam-2 @ git+https://github.com/facebookresearch/sam2.git"
+RUN pip install --no-cache-dir --no-deps segmentation-models-pytorch>=0.3.3 && \
+    pip install --no-cache-dir albumentations efficientnet-pytorch pretrainedmodels timm
+RUN pip install --no-cache-dir --no-deps "sam-2 @ git+https://github.com/facebookresearch/sam2.git" && \
+    pip install --no-cache-dir hydra-core iopath
 
 # ── Download SAM2 checkpoint ─────────────────────────────────────────────────
 RUN mkdir -p /models && \

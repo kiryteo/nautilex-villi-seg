@@ -455,11 +455,99 @@ def _build_and_train(
 # ======================================================================
 
 
+def _merge_overlapping_polygons(
+    polygons: list[Polygon],
+    overlap_threshold: float = 0.3,
+) -> list[Polygon]:
+    """Merge polygons that overlap significantly.
+
+    Two polygons are merged if:
+      - Their IoU > overlap_threshold, OR
+      - The intersection area > 50% of the smaller polygon's area
+
+    Uses union-find to group transitively overlapping polygons.
+
+    Parameters
+    ----------
+    polygons : list[Polygon]
+    overlap_threshold : float
+        IoU threshold for merging.
+
+    Returns
+    -------
+    list[Polygon]
+        Merged polygons.
+    """
+    from shapely import concave_hull
+    from shapely.ops import unary_union
+
+    if len(polygons) <= 1:
+        return polygons
+
+    n = len(polygons)
+
+    # Union-find
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Check all pairs for overlap
+    for i in range(n):
+        for j in range(i + 1, n):
+            if find(i) == find(j):
+                continue  # already merged
+            if not polygons[i].intersects(polygons[j]):
+                continue
+
+            intersection = polygons[i].intersection(polygons[j]).area
+            union_area = polygons[i].area + polygons[j].area - intersection
+            iou = intersection / union_area if union_area > 0 else 0
+
+            smaller_area = min(polygons[i].area, polygons[j].area)
+            containment = intersection / smaller_area if smaller_area > 0 else 0
+
+            if iou > overlap_threshold or containment > 0.5:
+                union(i, j)
+
+    # Group polygons by root
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+
+    merged = []
+    for indices in groups.values():
+        if len(indices) == 1:
+            merged.append(polygons[indices[0]])
+        else:
+            # Merge the group: take union, then simplify back to a clean polygon
+            group_polys = [polygons[i] for i in indices]
+            merged_poly = unary_union(group_polys)
+            # If MultiPolygon, keep the largest piece
+            if merged_poly.geom_type == "MultiPolygon":
+                merged_poly = max(merged_poly.geoms, key=lambda g: g.area)
+            if not merged_poly.is_valid:
+                merged_poly = merged_poly.buffer(0)
+            if not merged_poly.is_empty:
+                merged.append(merged_poly)
+
+    return merged
+
+
 def _extract_polygons_hdbscan(
     centroids_um: np.ndarray,
     probs: np.ndarray,
     threshold: float = 0.5,
-    min_cluster_size: int = 50,
+    n_gt_polygons: int = 5,
     min_samples: int = 10,
     hull_ratio: float = 0.3,
     buffer_um: float = 5.0,
@@ -471,6 +559,9 @@ def _extract_polygons_hdbscan(
     HDBSCAN adapts to variable-density clusters, avoiding the hard eps
     parameter of DBSCAN that caused close villi to merge or sparse villi
     to split.
+
+    The min_cluster_size is set adaptively based on the number of positive
+    cells and expected GT polygon count, preventing over-fragmentation.
 
     Returns
     -------
@@ -503,9 +594,20 @@ def _extract_polygons_hdbscan(
 
     pos_coords = centroids_um[pos_mask]
 
+    # Adaptive min_cluster_size: each villus should have many cells,
+    # so set floor high enough to prevent fragmentation.
+    # Heuristic: expect ~n_pos / n_gt cells per villus, use 1/3 of that as min.
+    adaptive_mcs = (
+        max(200, int(n_pos / (n_gt_polygons * 3))) if n_gt_polygons > 0 else 200
+    )
+    print(
+        f"[{_ts()}]   adaptive min_cluster_size: {adaptive_mcs} "
+        f"(n_pos={n_pos:,}, n_gt={n_gt_polygons})"
+    )
+
     if _USE_HDBSCAN:
         clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=min_cluster_size,
+            min_cluster_size=adaptive_mcs,
             min_samples=min_samples,
             cluster_selection_method="eom",
             core_dist_n_jobs=-1,
@@ -556,6 +658,17 @@ def _extract_polygons_hdbscan(
         f"[{_ts()}]   {len(polygons)} polygons after area filter "
         f"(>= {min_area_um2:.0f} um^2)"
     )
+
+    # Merge overlapping polygons to fix over-fragmentation
+    if len(polygons) > 1:
+        before = len(polygons)
+        polygons = _merge_overlapping_polygons(polygons, overlap_threshold=0.3)
+        if len(polygons) < before:
+            print(
+                f"[{_ts()}]   merged {before} -> {len(polygons)} polygons "
+                f"(overlap threshold=0.3)"
+            )
+
     return polygons
 
 
@@ -567,11 +680,18 @@ def _find_best_threshold(
 ) -> float:
     """Sweep thresholds and pick the one producing the polygon count closest to GT.
 
-    This is a fast proxy — the real metric is polygon IoU, but polygon count
-    is a cheap heuristic that avoids running full HDBSCAN for every candidate.
-    We count the number of connected spatial clusters at each threshold.
+    Uses HDBSCAN (matching the actual clustering method) to count clusters at
+    each threshold, with an adaptive min_cluster_size.
     """
-    from sklearn.cluster import DBSCAN
+    # Try HDBSCAN first for consistency with actual clustering
+    try:
+        import hdbscan as _hdbscan
+
+        _USE_HDBSCAN = True
+    except ImportError:
+        from sklearn.cluster import DBSCAN
+
+        _USE_HDBSCAN = False
 
     best_thr = 0.5
     best_diff = float("inf")
@@ -582,10 +702,25 @@ def _find_best_threshold(
         if n_pos < 10:
             continue
 
-        # Quick DBSCAN to count clusters
         pos_coords = centroids_um[pos_mask]
-        db = DBSCAN(eps=30.0, min_samples=10, n_jobs=-1)
-        labels = db.fit_predict(pos_coords)
+
+        # Adaptive min_cluster_size matching actual extraction
+        adaptive_mcs = (
+            max(200, int(n_pos / (n_gt_polygons * 3))) if n_gt_polygons > 0 else 200
+        )
+
+        if _USE_HDBSCAN:
+            clusterer = _hdbscan.HDBSCAN(
+                min_cluster_size=adaptive_mcs,
+                min_samples=10,
+                cluster_selection_method="eom",
+                core_dist_n_jobs=-1,
+            )
+            labels = clusterer.fit_predict(pos_coords)
+        else:
+            db = DBSCAN(eps=30.0, min_samples=10, n_jobs=-1)
+            labels = db.fit_predict(pos_coords)
+
         n_clusters = labels.max() + 1
 
         diff = abs(n_clusters - n_gt_polygons)
@@ -822,12 +957,12 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
         centroids_um, probs, n_gt_polygons=len(gt_polygons)
     )
 
-    # HDBSCAN clustering
+    # HDBSCAN clustering (adaptive min_cluster_size based on GT count)
     polygons = _extract_polygons_hdbscan(
         centroids_um=centroids_um,
         probs=probs,
         threshold=best_threshold,
-        min_cluster_size=50,
+        n_gt_polygons=len(gt_polygons),
         min_samples=10,
         hull_ratio=0.3,
         buffer_um=5.0,

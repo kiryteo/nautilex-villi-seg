@@ -1,12 +1,12 @@
 version: v2
-description: "Nautilex villi segmentation — v4 improved U-Net + GNN + ensemble"
+description: "Nautilex villi segmentation — v4i: U-Net primary + GNN cell-vote filtering ensemble"
 
 tasks:
   - name: segment
     image:
-      beaker: ashwin-samudre/villi-seg-full
+      beaker: ashwin-samudre/villi-seg-v4i
     context:
-      cluster: ai1/octo-nautilex-aws-h100
+      cluster: ai1/octo.hub-gcp-h200
       priority: normal
     resources:
       gpuCount: 1
