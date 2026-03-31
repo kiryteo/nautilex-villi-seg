@@ -259,10 +259,72 @@ These are directions we have NOT pursued that could yield improvements:
 | v1 | `01KMPST4C5TGWQHBJ02W7VE1W2` | Succeeded | 4 OK, 3 FAIL (stagate/unet/multimodal had import/API bugs) |
 | v2 | `01KMREWJB3RZHMYY4GX69J875C` | Succeeded | 6 OK, 1 FAIL (unet -- `torch.cuda.total_mem` -> `total_memory` typo) |
 | v3 | `01KMRH9EZKD737PVXP17ZCKEW4` | Succeeded | **All 7 OK** -- baseline complete (results in Section 5) |
+| v4a-g | (multiple) | Mixed | Docker/dep fixes, no algorithm changes |
+| v4h | — | Local | U-Net boundary weight fix + GNN adaptive HDBSCAN |
+| v4i | (pending) | — | **Cell-vote ensemble: F1@0.5=0.909, Mean IoU=0.805** |
 
 ---
 
-## 10. Known Gotchas
+## 10. v4 Iteration Results (Post-Baseline Improvements)
+
+### v4a–v4g: Iterative Bug Fixes
+Multiple iterations fixing Docker build issues, dependency conflicts (`smp` / `sam2` install order), buildx platform flags, and runtime errors. These did not change algorithmic behavior.
+
+### v4h: U-Net + GNN Bug Fixes
+- **U-Net boundary weight map fix**: `np.where` instead of `np.minimum` for correct foreground/boundary weighting
+- **GNN adaptive HDBSCAN**: `min_cluster_size` adapts to data size; added polygon merging for overlapping clusters
+
+### v4i: Cell-Vote Ensemble (Current Best)
+
+**Beaker experiment:** (pending submission)
+
+**Ensemble strategy** (`methods/ensemble.py`):
+1. Run U-Net tiled inference → probability map
+2. Threshold at 0.5 → connected components (instance candidates)
+3. Run GNN cell classification → per-cell villus probability
+4. **Cell-vote filtering**: For each U-Net component, count GNN-positive cells inside. Keep components where ≥40% of cells vote positive.
+5. **Natural gap detection**: Analyze intensity profile along component major axis. If a clear dip exists (>15% below mean), split the component at the gap.
+6. Contour extraction → polygon output
+
+**Results (from v4i logs):**
+
+| Metric | Value |
+|--------|-------|
+| Polygons produced | 6 |
+| GT polygons matched | **5/5** |
+| Precision@0.5 | 0.833 |
+| Recall@0.5 | **1.000** |
+| F1@0.5 | **0.909** |
+| Mean IoU (matched) | 0.805 |
+
+**Per-villus IoU:**
+| GT Polygon | IoU | Notes |
+|------------|-----|-------|
+| GT0 | 0.952 | Excellent |
+| GT3 | 0.891 | Excellent |
+| GT4 | 0.802 | Good |
+| GT2 | 0.757 | Good |
+| GT1 | 0.624 | Weakest — boundary imprecision |
+
+**Comparison with v3 baselines:**
+
+| Method | Polygons | Mean IoU | F1@0.5 |
+|--------|----------|----------|--------|
+| U-Net (v3) | 26 | 0.724 | 0.194 |
+| GNN (v3) | 9 | 0.527 | 0.429 |
+| **Ensemble (v4i)** | **6** | **0.805** | **0.909** |
+
+The ensemble combines U-Net's pixel precision with GNN's instance awareness, achieving both high IoU AND high F1 — solving the fundamental complementarity problem identified in v3.
+
+### Remaining Improvement Opportunities
+1. **GT1 boundary refinement**: IoU 0.624 is the weakest link. Could benefit from morphological active contour refinement.
+2. **False positive elimination**: 6 polygons vs 5 GT means 1 spurious detection. Tighter cell-vote threshold or area filtering could remove it.
+3. **Threshold tuning**: Both the U-Net probability threshold (0.5) and GNN vote threshold (40%) could be swept for optimal F1.
+4. **Multi-sample generalization**: Current pipeline is tuned to one sample with GT. Testing on other samples would reveal robustness.
+
+---
+
+## 12. Known Gotchas
 
 These are bugs/issues we already encountered and fixed. Avoid re-hitting them:
 
@@ -278,7 +340,7 @@ These are bugs/issues we already encountered and fixed. Avoid re-hitting them:
 
 ---
 
-## 11. How to Run
+## 13. How to Run
 
 ### Local syntax check
 ```bash

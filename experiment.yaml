@@ -1,10 +1,10 @@
 version: v2
-description: "Nautilex villi segmentation — v4i: U-Net primary + GNN cell-vote filtering ensemble"
+description: "Nautilex villi segmentation — v4j: confidence-scored + boundary-refined ensemble"
 
 tasks:
   - name: segment
     image:
-      beaker: ashwin-samudre/villi-seg-v4i
+      beaker: ashwin-samudre/villi-seg-v4j
     context:
       cluster: ai1/octo.hub-gcp-h200
       priority: normal
