@@ -1,21 +1,20 @@
 """
 Ensemble method: combines U-Net pixel predictions with GNN cell predictions.
 
-Strategy (v4k — U-Net primary + GNN cell-vote filtering + gentle refinement):
+Strategy (v4l — U-Net primary + GNN cell-vote filtering + gentle refinement):
   1. Run U-Net to get probability map (pixel-level villus prediction)
   2. Run GNN to get cell-level villus probabilities + centroids
-  3. Extract connected components from U-Net probability map (recall-biased threshold)
+  3. Extract connected components from U-Net prob map at FIXED low threshold
   4. For each component, compute confidence = f(cell_vote, mean_prob, area)
   5. Select components via gap detection on confidence scores
   6. Gently smooth polygon boundaries (light Savitzky-Golay only)
   7. Final FP elimination via confidence floor
 
-Key v4k fixes over v4j (which regressed IoU from 0.805 to 0.744):
-  - Threshold sweep uses Tversky index (recall-biased) instead of Dice
-    to prevent boundary shrinkage (0.60 → ~0.40-0.45 expected)
-  - Removed over-aggressive Gaussian prob-field smoothing
-  - Contour extraction from raw binary mask + light SG smoothing only
-  - Reduced polygon simplification tolerance (2.0 → 0.5 µm)
+Key v4l fix: use fixed UNET_THRESHOLD=0.40 instead of pixel-metric sweep.
+Both Dice (v4j) and Tversky (v4k) sweeps picked 0.60 because pixel metrics
+always prefer tighter masks when GT footprint is small. But the GNN cell-vote
+filter handles FP removal, so we want GENEROUS boundaries for better IoU.
+v4i used 0.50 → IoU 0.805. Going to 0.40 should capture even more boundary.
 """
 
 from __future__ import annotations
@@ -34,8 +33,11 @@ from utils.coords import PIXEL_SIZE_UM
 DOWNSCALE_FACTOR = 4  # Must match unet_seg.py
 MIN_AREA_UM2 = 5000.0
 
-# Adaptive threshold sweep range
-UNET_THRESHOLD_CANDIDATES = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+# Fixed U-Net threshold — generous to capture boundary pixels.
+# FP components are removed by GNN cell-vote confidence scoring.
+# v4i=0.50 → IoU 0.805; v4j/v4k=0.60 → IoU 0.744/0.751
+UNET_THRESHOLD = 0.40
+
 # GNN cell-vote thresholds to sweep
 GNN_VOTE_CANDIDATES = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
 
@@ -112,7 +114,7 @@ def _save_ensemble_diagnostics_v4j(
         ys_px = [y / ds_pixel_um for y in ys]
         axes[2].plot(xs_px, ys_px, color="red", linewidth=1.5)
     axes[2].set_title(
-        f"Ensemble v4k: {len(ensemble_polygons)} preds (red) vs "
+        f"Ensemble v4l: {len(ensemble_polygons)} preds (red) vs "
         f"{len(gt_polygons)} GT (green dashed)"
     )
     axes[2].axis("off")
@@ -133,7 +135,7 @@ def _save_ensemble_diagnostics_v4j(
         axes[3].set_title("Component Confidence")
 
     fig.suptitle(
-        f"Ensemble v4k: Confidence-Scored + Gentle Smoothing "
+        f"Ensemble v4l: Fixed Low Threshold + Confidence Filter "
         f"(U-Net thr={unet_thr:.2f}, GNN thr={gnn_thr:.2f})",
         fontsize=14,
     )
@@ -142,45 +144,6 @@ def _save_ensemble_diagnostics_v4j(
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"[{_ts()}]   saved diagnostic -> {path}")
-
-
-def _find_best_unet_threshold(
-    unet_prob: np.ndarray,
-    gt_mask_ds: np.ndarray,
-) -> float:
-    """Sweep U-Net probability thresholds using recall-biased Tversky index.
-
-    Tversky(alpha=0.3, beta=0.7) penalizes false negatives (missed boundary
-    pixels) more than false positives, preventing the threshold from climbing
-    too high and shrinking boundaries.  v4j used plain Dice which picked 0.60
-    and lost 0.06 mean IoU.
-    """
-    gt_flat = gt_mask_ds.astype(bool).ravel()
-    best_thr = 0.45  # sensible default if sweep fails
-    best_score = -1.0
-
-    ALPHA = 0.3  # FP weight (low — we tolerate some FPs)
-    BETA = 0.7  # FN weight (high — we penalise missed boundary pixels)
-
-    for thr in UNET_THRESHOLD_CANDIDATES:
-        pred_flat = unet_prob.ravel() >= thr
-        tp = float((pred_flat & gt_flat).sum())
-        fp = float((pred_flat & ~gt_flat).sum())
-        fn = float((~pred_flat & gt_flat).sum())
-        tversky = tp / (tp + ALPHA * fp + BETA * fn + 1e-8)
-        print(
-            f"[{_ts()}]     thr={thr:.2f}: Tversky={tversky:.4f} "
-            f"(TP={tp:.0f}, FP={fp:.0f}, FN={fn:.0f})"
-        )
-        if tversky > best_score:
-            best_score = tversky
-            best_thr = thr
-
-    print(
-        f"[{_ts()}]   U-Net threshold sweep: best={best_thr:.2f} "
-        f"(Tversky={best_score:.4f}, alpha={ALPHA}, beta={BETA})"
-    )
-    return best_thr
 
 
 def _smooth_contour(contour: np.ndarray, window: int = 9) -> np.ndarray:
@@ -219,12 +182,9 @@ def _smooth_contour(contour: np.ndarray, window: int = 9) -> np.ndarray:
     )
     return smoothed
 
-    # _refine_contour_with_prob removed in v4k — caused IoU regression
-    # by over-smoothing boundaries via Gaussian blur + dilated prob field.
-
 
 def segment(data_path: str, output_dir: str) -> list[Polygon]:
-    """Ensemble segmentation v4k: confidence-scored + gentle boundary smoothing.
+    """Ensemble segmentation v4l: fixed low threshold + confidence filter.
 
     Parameters
     ----------
@@ -238,8 +198,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     list[Polygon]
         Villi polygons in micron coordinates.
     """
-    from utils.io import load_annotations, load_morphology
-    from skimage import transform
+    from utils.io import load_annotations
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -248,7 +207,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     ds_pixel_um = PIXEL_SIZE_UM * DOWNSCALE_FACTOR
 
     print(
-        f"\n[{_ts()}] ===== ENSEMBLE v4k: Confidence-Scored + Gentle Smoothing =====\n"
+        f"\n[{_ts()}] ===== ENSEMBLE v4l: Fixed Low Threshold + Confidence Filter =====\n"
     )
 
     # ==================================================================
@@ -278,26 +237,11 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     )
 
     # ==================================================================
-    # Step 1b: Adaptive U-Net threshold via GT Dice sweep
+    # Step 1b: Fixed U-Net threshold (no sweep — see module docstring)
     # ==================================================================
-    print(f"\n[{_ts()}] Step 1b: Adaptive U-Net threshold selection...")
+    unet_thr = UNET_THRESHOLD
     gt_polygons = load_annotations(data_path)
-
-    # Rasterize GT to downscaled mask for threshold sweep
-    from methods.unet_seg import _rasterize_polygons, DOWNSCALE_FACTOR as DS
-
-    image_full = load_morphology(data_path, max_project=True)
-    gt_mask_full = _rasterize_polygons(gt_polygons, image_full.shape)
-    gt_mask_ds = transform.resize(
-        gt_mask_full.astype(np.uint8),
-        unet_prob.shape,
-        order=0,
-        anti_aliasing=False,
-        preserve_range=True,
-    ).astype(bool)
-    del image_full, gt_mask_full
-
-    unet_thr = _find_best_unet_threshold(unet_prob, gt_mask_ds)
+    print(f"[{_ts()}]   Using fixed U-Net threshold: {unet_thr:.2f}")
 
     # ==================================================================
     # Step 2: Run GNN → cell probabilities + centroids
@@ -587,7 +531,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
 
     elapsed = time.time() - t0
     print(
-        f"\n[{_ts()}] ENSEMBLE v4k DONE: {len(ensemble_polygons)} villi polygons in {elapsed:.1f}s"
+        f"\n[{_ts()}] ENSEMBLE v4l DONE: {len(ensemble_polygons)} villi polygons in {elapsed:.1f}s"
     )
 
     return ensemble_polygons

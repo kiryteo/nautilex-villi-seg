@@ -1,10 +1,10 @@
 version: v2
-description: "Nautilex villi segmentation — v4k: confidence-scored + gentle smoothing (IoU fix)"
+description: "Nautilex villi segmentation — v4l: fixed low threshold (0.40) + confidence filter"
 
 tasks:
   - name: segment
     image:
-      beaker: ashwin-samudre/villi-seg-v4k
+      beaker: ashwin-samudre/villi-seg-v4l
     context:
       cluster: ai1/octo.hub-gcp-h200
       priority: normal
