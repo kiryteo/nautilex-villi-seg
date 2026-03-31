@@ -1,21 +1,21 @@
 """
 Ensemble method: combines U-Net pixel predictions with GNN cell predictions.
 
-Strategy (v4j — U-Net primary + GNN cell-vote filtering + boundary refinement):
+Strategy (v4k — U-Net primary + GNN cell-vote filtering + gentle refinement):
   1. Run U-Net to get probability map (pixel-level villus prediction)
   2. Run GNN to get cell-level villus probabilities + centroids
-  3. Extract connected components from U-Net probability map (adaptive threshold)
+  3. Extract connected components from U-Net probability map (recall-biased threshold)
   4. For each component, compute confidence = f(cell_vote, mean_prob, area)
   5. Select components via gap detection on confidence scores
-  6. Refine polygon boundaries using probability-weighted contours + smoothing
+  6. Gently smooth polygon boundaries (light Savitzky-Golay only)
   7. Final FP elimination via confidence floor
 
-Key v4j improvements over v4i:
-  - Adaptive U-Net threshold via GT pixel Dice sweep
-  - Gaussian-smoothed probability contours for cleaner boundaries
-  - Confidence scoring combining cell-vote + prob + area
-  - Morphological active contour refinement for boundary precision
-  - Polygon smoothing (Gaussian kernel on contour coords)
+Key v4k fixes over v4j (which regressed IoU from 0.805 to 0.744):
+  - Threshold sweep uses Tversky index (recall-biased) instead of Dice
+    to prevent boundary shrinkage (0.60 → ~0.40-0.45 expected)
+  - Removed over-aggressive Gaussian prob-field smoothing
+  - Contour extraction from raw binary mask + light SG smoothing only
+  - Reduced polygon simplification tolerance (2.0 → 0.5 µm)
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ def _save_ensemble_diagnostics_v4j(
         ys_px = [y / ds_pixel_um for y in ys]
         axes[2].plot(xs_px, ys_px, color="red", linewidth=1.5)
     axes[2].set_title(
-        f"Ensemble v4j: {len(ensemble_polygons)} preds (red) vs "
+        f"Ensemble v4k: {len(ensemble_polygons)} preds (red) vs "
         f"{len(gt_polygons)} GT (green dashed)"
     )
     axes[2].axis("off")
@@ -133,7 +133,7 @@ def _save_ensemble_diagnostics_v4j(
         axes[3].set_title("Component Confidence")
 
     fig.suptitle(
-        f"Ensemble v4j: Confidence-Scored + Boundary-Refined "
+        f"Ensemble v4k: Confidence-Scored + Gentle Smoothing "
         f"(U-Net thr={unet_thr:.2f}, GNN thr={gnn_thr:.2f})",
         fontsize=14,
     )
@@ -148,31 +148,48 @@ def _find_best_unet_threshold(
     unet_prob: np.ndarray,
     gt_mask_ds: np.ndarray,
 ) -> float:
-    """Sweep U-Net probability thresholds, pick best pixel Dice vs GT."""
+    """Sweep U-Net probability thresholds using recall-biased Tversky index.
+
+    Tversky(alpha=0.3, beta=0.7) penalizes false negatives (missed boundary
+    pixels) more than false positives, preventing the threshold from climbing
+    too high and shrinking boundaries.  v4j used plain Dice which picked 0.60
+    and lost 0.06 mean IoU.
+    """
     gt_flat = gt_mask_ds.astype(bool).ravel()
-    gt_sum = gt_flat.sum()
-    best_thr = 0.5
-    best_dice = -1.0
+    best_thr = 0.45  # sensible default if sweep fails
+    best_score = -1.0
+
+    ALPHA = 0.3  # FP weight (low — we tolerate some FPs)
+    BETA = 0.7  # FN weight (high — we penalise missed boundary pixels)
 
     for thr in UNET_THRESHOLD_CANDIDATES:
         pred_flat = unet_prob.ravel() >= thr
-        inter = (pred_flat & gt_flat).sum()
-        dice = (2.0 * inter) / (pred_flat.sum() + gt_sum + 1e-8)
-        if dice > best_dice:
-            best_dice = dice
+        tp = float((pred_flat & gt_flat).sum())
+        fp = float((pred_flat & ~gt_flat).sum())
+        fn = float((~pred_flat & gt_flat).sum())
+        tversky = tp / (tp + ALPHA * fp + BETA * fn + 1e-8)
+        print(
+            f"[{_ts()}]     thr={thr:.2f}: Tversky={tversky:.4f} "
+            f"(TP={tp:.0f}, FP={fp:.0f}, FN={fn:.0f})"
+        )
+        if tversky > best_score:
+            best_score = tversky
             best_thr = thr
 
     print(
-        f"[{_ts()}]   U-Net threshold sweep: best={best_thr:.2f} (pixel Dice={best_dice:.4f})"
+        f"[{_ts()}]   U-Net threshold sweep: best={best_thr:.2f} "
+        f"(Tversky={best_score:.4f}, alpha={ALPHA}, beta={BETA})"
     )
     return best_thr
 
 
-def _smooth_contour(contour: np.ndarray, window: int = 15) -> np.ndarray:
+def _smooth_contour(contour: np.ndarray, window: int = 9) -> np.ndarray:
     """Smooth a contour using Savitzky-Golay filter for cleaner polygon edges.
 
     Applies circular padding so the contour remains closed. Falls back to
     the original contour if it's too short for the window size.
+
+    v4k: reduced default window from 15 → 9 to prevent over-smoothing.
     """
     n = len(contour)
     if n < window + 2:
@@ -202,51 +219,12 @@ def _smooth_contour(contour: np.ndarray, window: int = 15) -> np.ndarray:
     )
     return smoothed
 
-
-def _refine_contour_with_prob(
-    comp_mask: np.ndarray,
-    unet_prob: np.ndarray,
-    sigma: float = 2.0,
-) -> np.ndarray | None:
-    """Extract a probability-weighted, Gaussian-smoothed contour.
-
-    Instead of extracting contours from the raw binary mask, we:
-    1. Multiply the probability map by the dilated component mask
-    2. Apply Gaussian smoothing to the masked probabilities
-    3. Extract contour at 0.5 level from the smoothed field
-
-    This produces smoother, more accurate boundaries that follow the
-    probability gradient rather than noisy pixel edges.
-    """
-    from scipy.ndimage import gaussian_filter
-
-    # Dilate component mask slightly to capture probability gradient at edges
-    dilated = morphology.binary_dilation(comp_mask, morphology.disk(3))
-
-    # Masked probability field
-    prob_field = unet_prob * dilated.astype(np.float32)
-
-    # Gaussian smoothing for clean contour
-    prob_smooth = gaussian_filter(prob_field, sigma=sigma)
-
-    # Extract contour at 0.5 level
-    contours = measure.find_contours(prob_smooth, level=0.45)
-    if not contours:
-        return None
-
-    # Use the largest contour
-    contour = max(contours, key=len)
-    if len(contour) < 4:
-        return None
-
-    # Additional Savitzky-Golay smoothing on the contour coordinates
-    contour = _smooth_contour(contour, window=15)
-
-    return contour
+    # _refine_contour_with_prob removed in v4k — caused IoU regression
+    # by over-smoothing boundaries via Gaussian blur + dilated prob field.
 
 
 def segment(data_path: str, output_dir: str) -> list[Polygon]:
-    """Ensemble segmentation v4j: confidence-scored + boundary-refined.
+    """Ensemble segmentation v4k: confidence-scored + gentle boundary smoothing.
 
     Parameters
     ----------
@@ -270,7 +248,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     ds_pixel_um = PIXEL_SIZE_UM * DOWNSCALE_FACTOR
 
     print(
-        f"\n[{_ts()}] ===== ENSEMBLE v4j: Confidence-Scored + Boundary-Refined =====\n"
+        f"\n[{_ts()}] ===== ENSEMBLE v4k: Confidence-Scored + Gentle Smoothing =====\n"
     )
 
     # ==================================================================
@@ -522,7 +500,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
     # ==================================================================
     # Step 6: Extract refined polygon boundaries
     # ==================================================================
-    print(f"\n[{_ts()}] Step 6: Extracting refined polygon boundaries...")
+    print(f"\n[{_ts()}] Step 6: Extracting gently-smoothed polygon boundaries...")
 
     ensemble_polygons: list[Polygon] = []
     for c in selected:
@@ -533,19 +511,16 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
             comp_mask.astype(bool), area_threshold=500
         ).astype(np.uint8)
 
-        # Try probability-weighted refined contour first
-        contour = _refine_contour_with_prob(comp_mask, unet_prob, sigma=2.0)
+        # Extract contour from the binary mask directly (v4k: no prob-field smoothing)
+        contours = measure.find_contours(comp_mask, level=0.5)
+        if not contours:
+            continue
+        contour = max(contours, key=len)
+        if len(contour) < 4:
+            continue
 
-        if contour is None:
-            # Fall back to raw contour extraction
-            contours = measure.find_contours(comp_mask, level=0.5)
-            if not contours:
-                continue
-            contour = max(contours, key=len)
-            if len(contour) < 4:
-                continue
-            # Still smooth the raw contour
-            contour = _smooth_contour(contour, window=11)
+        # Light Savitzky-Golay smoothing only (window=9)
+        contour = _smooth_contour(contour, window=9)
 
         # Convert to micron coordinates
         coords_um = [
@@ -560,8 +535,8 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
             if poly.is_empty or poly.area < MIN_AREA_UM2:
                 continue
 
-            # Simplify with small tolerance to reduce vertex count without losing shape
-            poly = poly.simplify(tolerance=2.0, preserve_topology=True)
+            # v4k: very gentle simplification (0.5 µm) to avoid losing boundary detail
+            poly = poly.simplify(tolerance=0.5, preserve_topology=True)
 
             ensemble_polygons.append(poly)
             print(
@@ -612,7 +587,7 @@ def segment(data_path: str, output_dir: str) -> list[Polygon]:
 
     elapsed = time.time() - t0
     print(
-        f"\n[{_ts()}] ENSEMBLE v4j DONE: {len(ensemble_polygons)} villi polygons in {elapsed:.1f}s"
+        f"\n[{_ts()}] ENSEMBLE v4k DONE: {len(ensemble_polygons)} villi polygons in {elapsed:.1f}s"
     )
 
     return ensemble_polygons
